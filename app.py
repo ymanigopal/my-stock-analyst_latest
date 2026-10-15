@@ -157,7 +157,7 @@ tab_mkt, tab_sync, tab_port, tab_res, tab_wa, tab_edit = st.tabs([
     "🌐 Market Update",
     "🔗 Broker Sync",
     "📊 My Portfolio",
-    "📰 Stock Results",
+    "📰 Stock Results & Screener",
     "📲 WhatsApp/SMS",
     "✏️ Edit Stocks"
 ])
@@ -218,7 +218,6 @@ with tab_port:
         tot_pnl = tot_cur - tot_inv
         tot_pnl_pct = (tot_pnl / tot_inv) * 100 if tot_inv > 0 else 0.0
 
-        # Top Summary Metrics
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Invested", f"₹{tot_inv:,.0f}")
         col2.metric("Current Valuation", f"₹{tot_cur:,.0f}")
@@ -226,11 +225,9 @@ with tab_port:
 
         st.divider()
 
-        # Category / Theme Breakdown & Pie Chart
         st.markdown("##### 🥧 Asset Allocation by Sector / Theme")
         theme_summary = live_df.groupby("Theme")["Current_INR"].sum().reset_index()
         
-        # Display Pie Chart using Streamlit native chart
         st.altair_chart(
             __import__('altair').Chart(theme_summary).mark_arc(innerRadius=50).encode(
                 theta=__import__('altair').Theta(field="Current_INR", type="quantitative"),
@@ -240,7 +237,6 @@ with tab_port:
             use_container_width=True
         )
 
-        # Theme-wise breakdown cards
         st.markdown("##### 📂 Category-Wise Valuations")
         for _, row in theme_summary.iterrows():
             theme_name = row["Theme"]
@@ -257,13 +253,78 @@ with tab_port:
         )
 
 with tab_res:
+    st.markdown("#### 📰 Screener-Style Stock Results & Deep-Dive Hub")
     tickers = st.session_state.portfolio["Ticker"].tolist()
-    sel = st.selectbox("Choose Stock:", tickers)
-    if st.button("🔍 Deep-Dive Earnings & Filings"):
-        st_obj = yf.Ticker(sel)
-        q_stmt = st_obj.quarterly_income_stmt
-        q_str = q_stmt.to_string() if (q_stmt is not None and not q_stmt.empty) else "N/A"
-        st.markdown(ask_gemini(f"Analyze financials for {sel}:\n{q_str[:2500]}"))
+    sel_ticker = st.selectbox("Select Stock to Analyze:", tickers)
+    
+    # Quick metadata lookup
+    match_row = st.session_state.portfolio[st.session_state.portfolio["Ticker"] == sel_ticker]
+    stock_name = match_row["Name"].values[0] if not match_row.empty else sel_ticker
+
+    if st.button("🔍 Generate Comprehensive Screener & Deep-Dive Analysis", type="primary", use_container_width=True):
+        with st.spinner(f"Pulling Screener fundamentals, quarterly numbers, conference call insights, and latest updates for {stock_name} ({sel_ticker})..."):
+            try:
+                stock_obj = yf.Ticker(sel_ticker)
+                info = stock_obj.info
+                q_stmt = stock_obj.quarterly_income_stmt
+                q_str = q_stmt.to_string() if (q_stmt is not None and not q_stmt.empty) else "Quarterly data unavailable."
+                
+                # Extract basic metrics from yahoo info if present
+                pe_ratio = info.get("trailingPE", "N/A")
+                pb_ratio = info.get("priceToBook", "N/A")
+                market_cap = info.get("marketCap", "N/A")
+                div_yield = info.get("dividendYield", "N/A")
+                52w_high = info.get("fiftyTwoWeekHigh", "N/A")
+                52w_low = info.get("fiftyTwoWeekLow", "N/A")
+                
+                news_list = stock_obj.news
+                news_text = ""
+                if news_list:
+                    for n in news_list[:5]:
+                        title = n.get("content", n).get("title", "No title")
+                        pub = n.get("content", n).get("providerPublishTime", "")
+                        news_text += f"- {title}\n"
+                else:
+                    news_text = "No recent breaking updates found."
+
+            except Exception as e:
+                q_str = "Error loading financials."
+                pe_ratio, pb_ratio, market_cap, div_yield, 52w_high, 52w_low = "N/A", "N/A", "N/A", "N/A", "N/A", "N/A"
+                news_text = "Error fetching news."
+
+            screener_prompt = f"""
+            Act as an elite stock market screener and fundamental research analyst. Provide a structured, comprehensive analysis for {stock_name} ({sel_ticker}).
+            
+            Key Live Metrics:
+            - Trailing P/E: {pe_ratio}
+            - Price-to-Book: {pb_ratio}
+            - Market Cap: {market_cap}
+            - Dividend Yield: {div_yield}
+            - 52-Week High/Low: {52w_high} / {52w_low}
+            
+            Recent Quarterly Financial Statement Snippet:
+            {q_str[:3000]}
+            
+            Latest News & Corporate Updates:
+            {news_text}
+            
+            Provide the response structured clearly with the following sections (Screener style):
+            1. **📊 Key Fundamental Ratios & Valuation Overview** (PE, PB, Market Cap, Margins)
+            2. **📈 Previous & Latest Results Analysis** (Revenue growth, Net Profit trends, QoQ/YoY performance)
+            3. **📅 Earnings Calendar & Next Results Outlook** (Expected timeline, key milestones to watch)
+            4. **🎙️ Management & Conference Call Key Takeaways** (Guidance, expansion plans, margins commentary)
+            5. **🚨 Latest Breaking Updates & Corporate Actions** (Recent announcements, stock impact)
+            6. **💡 Analyst Recommendation** (Buy/Hold/Accumulate verdict for a 3-5 year horizon)
+            """
+            
+            deep_rep = ask_gemini(screener_prompt)
+            if deep_rep:
+                st.session_state[f"deep_analysis_{sel_ticker}"] = deep_rep
+
+    if f"deep_analysis_{sel_ticker}" in st.session_state:
+        st.markdown(st.session_state[f"deep_analysis_{sel_ticker}"])
+    else:
+        st.info(f"Select a stock above and tap the button to load full Screener metrics and deep results for {stock_name}.")
 
 with tab_wa:
     edited_contacts = st.data_editor(pd.DataFrame(st.session_state.contacts), num_rows="dynamic", use_container_width=True)
