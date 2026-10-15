@@ -3,4 +3,5 @@ pandas
 yfinance
 google-genai
 twilio
-tabulate
+requests
+requests-oauthlib
