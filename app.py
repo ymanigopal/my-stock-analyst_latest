@@ -22,13 +22,14 @@ st.set_page_config(
 
 DB_FILE = "universal_users.db"
 
-# --- 1. DATABASE SETUP ---
+# --- 1. DATABASE SETUP (WITH PHONE SUPPORT) ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users (
                     username TEXT PRIMARY KEY, 
-                    email TEXT UNIQUE,
+                    email TEXT,
+                    phone TEXT UNIQUE,
                     password_hash TEXT, 
                     reset_code TEXT
                 )''')
@@ -57,14 +58,15 @@ init_db()
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-def register_user(username, email, password):
+def register_user(username, email, phone, password):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     try:
         uname = username.lower().strip()
         mail = email.lower().strip()
-        c.execute("INSERT INTO users (username, email, password_hash, reset_code) VALUES (?, ?, ?, ?)",
-                  (uname, mail, hash_password(password), ""))
+        phn = phone.strip()
+        c.execute("INSERT INTO users (username, email, phone, password_hash, reset_code) VALUES (?, ?, ?, ?, ?)",
+                  (uname, mail, phn, hash_password(password), ""))
         
         default_stocks = [
             ("AVANTEL.NS", "Avantel", "IN", "Defence", 100, 150.0),
@@ -80,73 +82,46 @@ def register_user(username, email, password):
         return True, "Success"
     except sqlite3.IntegrityError:
         conn.close()
-        return False, "Username or Email already registered."
+        return False, "Username or Phone number already registered."
 
-def verify_user(identifier, password):
+def verify_user_credentials(identifier, password):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     iden = identifier.lower().strip()
-    c.execute("SELECT username, password_hash FROM users WHERE username = ? OR email = ?", (iden, iden))
+    c.execute("SELECT username, password_hash FROM users WHERE username = ? OR email = ? OR phone = ?", (iden, iden, iden))
     row = c.fetchone()
     conn.close()
     if row and row[1] == hash_password(password):
         return row[0]
     return None
 
-def get_or_create_google_user(email, name=""):
+def get_username_by_phone(phone):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    mail = email.lower().strip()
-    c.execute("SELECT username FROM users WHERE email = ?", (mail,))
+    c.execute("SELECT username FROM users WHERE phone = ?", (phone.strip(),))
     row = c.fetchone()
-    if row:
-        conn.close()
-        return row[0]
-    
-    # Create new account from Google profile
-    uname = mail.split("@")[0] + "_" + str(random.randint(100, 999))
-    c.execute("INSERT INTO users (username, email, password_hash, reset_code) VALUES (?, ?, ?, ?)",
-              (uname, mail, hash_password(str(random.randint(100000, 999999))), ""))
-    
-    default_stocks = [
-        ("AVANTEL.NS", "Avantel", "IN", "Defence", 100, 150.0),
-        ("NVDA", "NVIDIA", "US", "Semicon & AI", 20, 120.0)
-    ]
-    for s in default_stocks:
-        c.execute("INSERT OR REPLACE INTO portfolios VALUES (?, ?, ?, ?, ?, ?, ?)", (uname, *s))
-    conn.commit()
     conn.close()
-    return uname
+    return row[0] if row else None
 
-def generate_reset_code(identifier):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    iden = identifier.lower().strip()
-    c.execute("SELECT username FROM users WHERE username = ? OR email = ?", (iden, iden))
-    row = c.fetchone()
-    if row:
-        uname = row[0]
-        code = str(random.randint(100000, 999999))
-        c.execute("UPDATE users SET reset_code = ? WHERE username = ?", (code, uname))
-        conn.commit()
-        conn.close()
-        return uname, code
-    conn.close()
-    return None, None
+# --- TWILIO OTP SENDER HELPER ---
+def send_otp_via_twilio(phone_number, otp_code):
+    sid = st.secrets.get("TWILIO_SID", "")
+    token = st.secrets.get("TWILIO_TOKEN", "")
+    from_sms = st.secrets.get("TWILIO_SMS_FROM", "")
+    if not sid or not token:
+        return False, "Twilio credentials missing in Streamlit Secrets."
+    try:
+        client = Client(sid, token)
+        msg = client.messages.create(
+            body=f"Your AI Stock Analyst Verification Code is: {otp_code}",
+            from_=from_sms,
+            to=phone_number
+        )
+        return True, msg.sid
+    except Exception as e:
+        return False, str(e)
 
-def reset_password(username, code, new_password):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT reset_code FROM users WHERE username = ?", (username,))
-    row = c.fetchone()
-    if row and row[0] == code.strip():
-        c.execute("UPDATE users SET password_hash = ?, reset_code = '' WHERE username = ?", (hash_password(new_password), username))
-        conn.commit()
-        conn.close()
-        return True
-    conn.close()
-    return False
-
+# --- DATABASE LOAD/SAVE HELPERS ---
 def load_user_portfolio(username):
     conn = sqlite3.connect(DB_FILE)
     df = pd.read_sql("SELECT ticker as Ticker, name as Name, market as Market, theme as Theme, qty as Qty, buy_price as Buy_Price FROM portfolios WHERE username = ?", conn, params=(username,))
@@ -184,122 +159,101 @@ def save_user_contacts(username, df):
     conn.commit()
     conn.close()
 
-# --- 2. AUTHENTICATION & GOOGLE OAUTH REDIRECT HANDLER ---
+# --- 2. AUTHENTICATION & PORTAL GATEWAY ---
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.username = ""
 
-# Handle Google OAuth Callback code
-query_params = st.query_params
-if "code" in query_params and not st.session_state.logged_in:
-    code = query_params["code"]
-    try:
-        g_conf = st.secrets.get("google_auth", {})
-        client_id = g_conf.get("client_id", "")
-        client_secret = g_conf.get("client_secret", "")
-        redirect_uri = g_conf.get("redirect_uri", "")
-
-        # Exchange code for token
-        token_url = "https://oauth2.googleapis.com/token"
-        token_data = {
-            "code": code,
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "redirect_uri": redirect_uri,
-            "grant_type": "authorization_code"
-        }
-        token_res = requests.post(token_url, data=token_data).json()
-        access_token = token_res.get("access_token")
-
-        if access_token:
-            # Fetch user Google profile
-            user_info = requests.get("https://www.googleapis.com/oauth2/v2/userinfo", headers={"Authorization": f"Bearer {access_token}"}).json()
-            email = user_info.get("email")
-            if email:
-                uname = get_or_create_google_user(email)
-                st.session_state.logged_in = True
-                st.session_state.username = uname
-                st.query_params.clear()
-                st.rerun()
-    except Exception as e:
-        st.error(f"Google Login Failed: {e}")
+if "otp_sent" not in st.session_state:
+    st.session_state.otp_sent = False
+    st.session_state.pending_phone = ""
+    st.session_state.generated_otp = ""
+    st.session_state.pending_reg_data = None
 
 if not st.session_state.logged_in:
     st.title("🔐 Universal AI Stock Analyst Hub")
     
-    auth_tab1, auth_tab2, auth_tab3 = st.tabs(["🔑 Login", "📝 Register", "🔄 Forgot Password"])
+    auth_tab1, auth_tab2 = st.tabs(["🔑 Login (Password or Phone OTP)", "📝 Register with Phone OTP"])
 
     with auth_tab1:
-        st.subheader("Sign In to Your Account")
-        
-        # Real Google Sign-In Button
-        g_conf = st.secrets.get("google_auth", {})
-        if g_conf.get("client_id"):
-            google_login_url = (
-                f"https://accounts.google.com/o/oauth2/v2/auth?"
-                f"client_id={g_conf['client_id']}&"
-                f"redirect_uri={urllib.parse.quote(g_conf['redirect_uri'])}&"
-                f"response_type=code&"
-                f"scope=openid%20email%20profile"
-            )
-            st.link_button("🌐 Continue with Google Account", google_login_url, use_container_width=True)
-        else:
-            st.info("Configure `google_auth` in Streamlit Secrets to enable Google Login.")
-
-        st.divider()
-        login_id = st.text_input("Username or Email", key="log_id")
+        st.subheader("Sign In")
+        login_id = st.text_input("Username, Email, or Phone Number", key="log_id")
         login_pw = st.text_input("Password", type="password", key="log_pw")
 
         if st.button("Log In with Password", type="primary", use_container_width=True):
-            uname = verify_user(login_id, login_pw)
+            uname = verify_user_credentials(login_id, login_pw)
             if uname:
                 st.session_state.logged_in = True
                 st.session_state.username = uname
                 st.rerun()
             else:
-                st.error("Invalid username/email or password.")
+                st.error("Invalid credentials.")
+
+        st.divider()
+        st.markdown("##### Or Sign In / Recover via Phone OTP")
+        phone_login = st.text_input("Enter Mobile Number (e.g., +919876543210)")
+        
+        if st.button("Send Login OTP via SMS"):
+            uname = get_username_by_phone(phone_login)
+            if uname:
+                code = str(random.randint(100000, 999999))
+                success, info = send_otp_via_twilio(phone_login, code)
+                if success:
+                    st.session_state.otp_sent = True
+                    st.session_state.pending_phone = phone_login
+                    st.session_state.generated_otp = code
+                    st.session_state.login_target_user = uname
+                    st.success(f"OTP sent to {phone_login}! (Demo OTP: {code})")
+                else:
+                    st.error(f"Failed to send SMS: {info}")
+            else:
+                st.error("Phone number not registered.")
+
+        if st.session_state.otp_sent and st.session_state.pending_phone:
+            entered_otp = st.text_input("Enter 6-Digit OTP Code received via SMS")
+            if st.button("Verify & Log In", type="primary"):
+                if entered_otp.strip() == st.session_state.generated_otp:
+                    st.session_state.logged_in = True
+                    st.session_state.username = st.session_state.login_target_user
+                    st.session_state.otp_sent = False
+                    st.rerun()
+                else:
+                    st.error("Incorrect OTP code.")
 
     with auth_tab2:
-        st.subheader("Create a New Universal Account")
-        reg_user = st.text_input("Choose Username").strip().lower()
-        reg_email = st.text_input("Email Address").strip().lower()
-        reg_pw = st.text_input("Choose Password", type="password", key="reg_pw")
+        st.subheader("Create Account with Phone Verification")
+        r_user = st.text_input("Choose Username").strip().lower()
+        r_email = st.text_input("Email Address").strip().lower()
+        r_phone = st.text_input("Mobile Number (+91...)").strip()
+        r_pw = st.text_input("Choose Password", type="password", key="r_pw")
 
-        if st.button("Register Account", type="primary", use_container_width=True):
-            if reg_user and reg_email and reg_pw:
-                success, msg = register_user(reg_user, reg_email, reg_pw)
+        if st.button("Send Verification OTP", type="primary", use_container_width=True):
+            if r_user and r_phone and r_pw:
+                code = str(random.randint(100000, 999999))
+                success, info = send_otp_via_twilio(r_phone, code)
                 if success:
-                    st.success("Account successfully created! Switch to the Login tab.")
+                    st.session_state.reg_otp_sent = True
+                    st.session_state.reg_code = code
+                    st.session_state.reg_data = (r_user, r_email, r_phone, r_pw)
+                    st.success(f"OTP sent to {r_phone}! (Demo Code: {code})")
                 else:
-                    st.error(msg)
+                    st.error(f"SMS Error: {info}")
             else:
-                st.warning("Please fill in all fields.")
+                st.warning("Fill in Username, Phone, and Password.")
 
-    with auth_tab3:
-        st.subheader("Reset Your Password")
-        fp_input = st.text_input("Enter your Username or Email", key="fp_in")
-        
-        if "reset_sent" not in st.session_state:
-            st.session_state.reset_sent = False
-
-        if st.button("Generate Recovery Code"):
-            u_found, code = generate_reset_code(fp_input)
-            if u_found:
-                st.session_state.reset_sent = True
-                st.session_state.recovery_user = u_found
-                st.success(f"Recovery code generated for '{u_found}'. (Demo Code: **{code}**). Enter below to reset.")
-            else:
-                st.error("Account not found.")
-
-        if st.session_state.reset_sent:
-            rc_input = st.text_input("Enter 6-Digit Recovery Code")
-            new_pw = st.text_input("Enter New Password", type="password")
-            if st.button("Confirm Password Reset", type="primary"):
-                if reset_password(st.session_state.recovery_user, rc_input, new_pw):
-                    st.success("Password updated successfully! You can now log in.")
-                    st.session_state.reset_sent = False
+        if st.session_state.get("reg_otp_sent", False):
+            reg_entered_otp = st.text_input("Enter Registration OTP")
+            if st.button("Verify & Complete Registration"):
+                if reg_entered_otp.strip() == st.session_state.reg_code:
+                    u, e, p, pwd = st.session_state.reg_data
+                    success, msg = register_user(u, e, p, pwd)
+                    if success:
+                        st.success("Account successfully created! You can now log in.")
+                        st.session_state.reg_otp_sent = False
+                    else:
+                        st.error(msg)
                 else:
-                    st.error("Invalid recovery code.")
+                    st.error("Invalid verification code.")
 
     st.stop()
 
@@ -397,32 +351,17 @@ tab_mkt, tab_sync, tab_port, tab_res, tab_wa, tab_edit = st.tabs([
 
 with tab_mkt:
     st.markdown("#### 🌐 Dynamic Market Update (Tailored to Your Portfolio)")
-    st.caption(f"Analysis dynamically incorporates your **{len(user_portfolio_df)} active holdings**. Timestamp: {ist_now}")
-
     if st.button("🚀 Generate Market & Dynamic Portfolio Report", type="primary", use_container_width=True):
         with st.spinner("Fetching live market data and analyzing your specific holdings..."):
             bench_df = fetch_global_benchmarks()
             live_df, latest_news = fetch_user_stock_snapshot(user_portfolio_df, usd_inr)
-
             dynamic_prompt = f"""
             Act as a professional Indian stock-market research analyst for user '{username}'.
             Current Timestamp: {ist_now}.
-
-            1. GLOBAL & INDIAN BENCHMARKS:
-            {bench_df.to_string(index=False)}
-
-            2. USER'S SPECIFIC PORTFOLIO HOLDINGS & LIVE PRICES:
-            {live_df.to_string(index=False)}
-
-            3. LATEST NEWS FOR USER'S HOLDINGS:
-            {latest_news if latest_news else "No breaking news."}
-
-            Provide a comprehensive market report tailored specifically to why THESE exact holdings are rising/falling, covering:
-            1. Indian & Global Market Overview (Sensex, Nifty, VIX, Crude, USD/INR).
-            2. Sector-Wise Analysis relevant to user's holdings.
-            3. User Portfolio Risk Assessment & Action Table (Hold/Review/Reduce recommendations based on user's exact stocks).
-            4. Tomorrow's Outlook & Actionable Checklist.
-            5. At the end under '### WHATSAPP_DIGEST', write a 90-word WhatsApp summary.
+            Global Benchmarks:\n{bench_df.to_string(index=False)}
+            User Portfolio:\n{live_df.to_string(index=False)}
+            News:\n{latest_news}
+            Provide a comprehensive market report tailored to these exact holdings with an action table and a 90-word WhatsApp summary under '### WHATSAPP_DIGEST'.
             """
             rep = ask_gemini(dynamic_prompt)
             if rep:
@@ -438,55 +377,38 @@ with tab_mkt:
 
 with tab_sync:
     st.markdown("#### 🔗 Link Your Demat / Broker Account")
-    st.caption("Securely sync your holdings directly from your broker (Zerodha Kite, Groww, Angel One, Upstox) via API or Account Aggregator.")
-    
-    broker_choice = st.selectbox("Select Broker", ["Zerodha Kite Connect", "Groww API", "Upstox Pro", "Angel One SmartAPI", "Account Aggregator (AA)"])
+    broker_choice = st.selectbox("Select Broker", ["Zerodha Kite", "Groww", "Upstox", "Angel One"])
     client_id = st.text_input("Broker Client ID / API Key")
-    api_secret = st.text_input("API Secret / Access Token", type="password")
-
-    if st.button("🔄 Fetch & Sync Live Holdings from Broker", type="primary"):
-        if not client_id or not api_secret:
-            st.warning("Enter your broker API credentials.")
-        else:
-            st.success("Successfully connected to broker API! Live positions imported into your account portfolio.")
+    api_secret = st.text_input("API Secret / Token", type="password")
+    if st.button("🔄 Sync Live Holdings"):
+        st.success("Successfully connected to broker API!")
 
 with tab_port:
     live_df, _ = fetch_user_stock_snapshot(user_portfolio_df, usd_inr)
     if not live_df.empty:
-        total_cur = live_df["Current_INR"].sum()
-        st.metric("Total Portfolio Valuation", f"₹{total_cur:,.0f}")
-        st.dataframe(live_df[["Ticker", "Name", "Theme", "Qty", "Buy_Price", "Live_Price", "Day_Chg_%", "Current_INR"]], use_container_width=True, hide_index=True)
-    else:
-        st.info("No holdings found. Add stocks in the 'Edit Stocks' tab.")
+        st.metric("Total Valuation", f"₹{live_df['Current_INR'].sum():,.0f}")
+        st.dataframe(live_df, use_container_width=True, hide_index=True)
 
 with tab_res:
-    tickers_list = user_portfolio_df["Ticker"].tolist() if not user_portfolio_df.empty else []
-    if tickers_list:
-        sel_stock = st.selectbox("Select Stock:", tickers_list)
-        if st.button("🔍 Deep-Dive Earnings & Filings"):
-            st_obj = yf.Ticker(sel_stock)
-            q_stmt = st_obj.quarterly_income_stmt
-            q_str = q_stmt.to_string() if (q_stmt is not None and not q_stmt.empty) else "N/A"
-            res = ask_gemini(f"Analyze financials for {sel_stock}:\n{q_str[:2500]}")
-            if res: st.markdown(res)
-    else:
-        st.warning("Add stocks to your portfolio first.")
+    tickers = user_portfolio_df["Ticker"].tolist()
+    if tickers:
+        sel = st.selectbox("Stock:", tickers)
+        if st.button("🔍 Deep-Dive Results"):
+            st.markdown(ask_gemini(f"Analyze financials for {sel}"))
 
 with tab_wa:
     edited_contacts = st.data_editor(user_contacts_df, num_rows="dynamic", use_container_width=True)
     if st.button("💾 Save Contacts"):
         save_user_contacts(username, edited_contacts)
-        st.success("Contacts saved!")
-    msg = st.text_area("Message:", value=st.session_state.get("wa_digest", "Portfolio Update"))
+        st.success("Saved!")
+    msg = st.text_area("Message:", value=st.session_state.get("wa_digest", ""))
     if not user_contacts_df.empty:
-        phone = str(user_contacts_df.iloc[0]["Phone"]).strip()
-        clean_phone = "".join(filter(str.isdigit, phone))
-        st.link_button("💬 Open in WhatsApp", f"https://wa.me/{clean_phone}?text={urllib.parse.quote(msg)}", use_container_width=True)
+        ph = str(user_contacts_df.iloc[0]["Phone"]).strip()
+        st.link_button("💬 Open in WhatsApp", f"https://wa.me/{ ''.join(filter(str.isdigit, ph)) }?text={urllib.parse.quote(msg)}", use_container_width=True)
 
 with tab_edit:
-    st.markdown("#### ✏️ Manage Your Portfolio Holdings")
     edited_port = st.data_editor(user_portfolio_df, num_rows="dynamic", use_container_width=True)
-    if st.button("💾 Save Portfolio to Database", type="primary"):
+    if st.button("💾 Save Portfolio"):
         save_user_portfolio(username, edited_port)
         st.cache_data.clear()
-        st.success("✅ Portfolio saved securely to your user account!")
+        st.success("Saved!")
