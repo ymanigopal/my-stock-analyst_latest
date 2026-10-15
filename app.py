@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 from google import genai
-from twilio.rest import Client
 import json
 import os
 import urllib.parse
@@ -124,6 +123,13 @@ def fetch_user_stock_snapshot(df, fx):
                 chg = round(((ltp - prev) / prev) * 100, 2)
             else:
                 ltp, chg = float(r["Buy_Price"]), 0.0
+            
+            # P&L Calculations
+            inv = float(r["Qty"]) * float(r["Buy_Price"]) * (fx if r["Market"] == "US" else 1.0)
+            cur = float(r["Qty"]) * ltp * (fx if r["Market"] == "US" else 1.0)
+            pnl = cur - inv
+            pnl_pct = (pnl / inv) * 100 if inv > 0 else 0.0
+
             news = stock.news
             if news:
                 title = news[0].get("content", news[0]).get("title", "")
@@ -131,13 +137,16 @@ def fetch_user_stock_snapshot(df, fx):
                     headlines.append(f"- {r.get('Name', t)} ({t}): {title}")
         except Exception:
             ltp, chg = float(r["Buy_Price"]), 0.0
+            inv = float(r["Qty"]) * float(r["Buy_Price"])
+            cur = inv
+            pnl, pnl_pct = 0.0, 0.0
 
-        mult = fx if r["Market"] == "US" else 1.0
-        cur_val = round(float(r["Qty"]) * ltp * mult, 0)
         rows.append({
             "Ticker": t, "Name": r.get("Name", t), "Theme": r.get("Theme", "General"),
             "Qty": r["Qty"], "Buy_Price": r["Buy_Price"],
-            "Live_Price": ltp, "Day_Chg_%": chg, "Current_INR": cur_val
+            "Live_Price": ltp, "Day_Chg_%": chg, 
+            "Invested_INR": round(inv, 0), "Current_INR": round(cur, 0),
+            "Unrealized_PnL": round(pnl, 0), "PnL_%": round(pnl_pct, 2)
         })
     return pd.DataFrame(rows), "\n".join(headlines[:20])
 
@@ -201,10 +210,24 @@ with tab_sync:
         st.success("Successfully connected to broker API!")
 
 with tab_port:
+    st.markdown("#### 📊 Live Portfolio Overview & P&L Tracker")
     live_df, _ = fetch_user_stock_snapshot(st.session_state.portfolio, usd_inr)
     if not live_df.empty:
-        st.metric("Total Portfolio Valuation", f"₹{live_df['Current_INR'].sum():,.0f}")
-        st.dataframe(live_df, use_container_width=True, hide_index=True)
+        tot_inv = live_df["Invested_INR"].sum()
+        tot_cur = live_df["Current_INR"].sum()
+        tot_pnl = tot_cur - tot_inv
+        tot_pnl_pct = (tot_pnl / tot_inv) * 100 if tot_inv > 0 else 0.0
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Invested", f"₹{tot_inv:,.0f}")
+        col2.metric("Current Valuation", f"₹{tot_cur:,.0f}")
+        col3.metric("Total Unrealized P&L", f"₹{tot_pnl:,.0f}", f"{tot_pnl_pct:+.2f}%")
+
+        st.dataframe(
+            live_df[["Ticker", "Name", "Theme", "Qty", "Buy_Price", "Live_Price", "Day_Chg_%", "Current_INR", "Unrealized_PnL", "PnL_%"]],
+            use_container_width=True,
+            hide_index=True
+        )
 
 with tab_res:
     tickers = st.session_state.portfolio["Ticker"].tolist()
