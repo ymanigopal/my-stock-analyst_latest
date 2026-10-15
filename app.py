@@ -412,3 +412,39 @@ with tab_edit:
         save_user_portfolio(username, edited_port)
         st.cache_data.clear()
         st.success("Saved!")
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY, 
+                    email TEXT,
+                    password_hash TEXT, 
+                    reset_code TEXT
+                )''')
+    
+    # Safely check if 'phone' column exists, if not add it
+    c.execute("PRAGMA table_info(users)")
+    columns = [col[1] for col in c.fetchall()]
+    if "phone" not in columns:
+        c.execute("ALTER TABLE users ADD COLUMN phone TEXT")
+
+    c.execute('''CREATE TABLE IF NOT EXISTS portfolios (
+                    username TEXT,
+                    ticker TEXT,
+                    name TEXT,
+                    market TEXT,
+                    theme TEXT,
+                    qty REAL,
+                    buy_price REAL,
+                    PRIMARY KEY (username, ticker)
+                )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS contacts (
+                    username TEXT,
+                    name TEXT,
+                    phone TEXT,
+                    active INTEGER,
+                    PRIMARY KEY (username, phone)
+                )''')
+    conn.commit()
+    conn.close()
