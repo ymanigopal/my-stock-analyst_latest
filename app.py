@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 from google import genai
-from google.genai import types
 from twilio.rest import Client
 import json
 import os
@@ -72,10 +71,9 @@ with st.sidebar:
     default_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
     gemini_key = st.text_input("Gemini API Key", value=default_key, type="password")
     model_choice = st.selectbox(
-        "Latest Gemini Model",
-        ["gemini-3.8-flash", "gemini-flash-latest"]
+        "Gemini Model (Free Tier Ready)",
+        ["gemini-3.8-flash", "gemini-3.1-flash-lite"]
     )
-    use_search = st.checkbox("Enable Live Google Search Grounding", value=True)
     usd_inr = st.number_input("USD/INR Rate (₹)", value=88.75, step=0.1)
 
     st.divider()
@@ -84,42 +82,45 @@ with st.sidebar:
     twilio_token = st.text_input("Twilio Auth Token", value=st.secrets.get("TWILIO_TOKEN", "") if hasattr(st, "secrets") else "", type="password")
     twilio_from = st.text_input("Twilio WhatsApp/SMS From", value="whatsapp:+14155238886")
 
-# --- HELPER: CALL GEMINI 3.8 FLASH ---
+# --- FREE-TIER SAFE GEMINI CALL (NO SEARCH GROUNDING 429) ---
 def ask_gemini(prompt_text):
     clean_key = gemini_key.strip()
     if not clean_key:
         st.warning("Tap the `>` arrow at the top-left to paste your Gemini API Key first!")
         return None
     client = genai.Client(api_key=clean_key)
-    if use_search:
-        config = types.GenerateContentConfig(tools=[{"google_search": {}}])
-        response = client.models.generate_content(
-            model=model_choice,
-            contents=prompt_text,
-            config=config
-        )
-    else:
-        response = client.models.generate_content(
-            model=model_choice,
-            contents=prompt_text
-        )
+    response = client.models.generate_content(
+        model=model_choice,
+        contents=prompt_text
+    )
     return response.text
 
+# --- LIVE DATA + NEWS FETCHER VIA YFINANCE (FREE & UNLIMITED) ---
 @st.cache_data(ttl=300)
-def fetch_live_snapshot(df, fx):
+def fetch_live_snapshot_and_news(df, fx):
     rows = []
+    headlines = []
     for _, r in df.iterrows():
         t = str(r["Ticker"]).strip()
         try:
-            hist = yf.Ticker(t).history(period="5d")
+            stock = yf.Ticker(t)
+            hist = stock.history(period="5d")
             if not hist.empty and len(hist) >= 2:
                 ltp = round(float(hist["Close"].iloc[-1]), 2)
                 prev = float(hist["Close"].iloc[-2])
                 chg = round(((ltp - prev) / prev) * 100, 2)
             else:
                 ltp, chg = float(r["Buy_Price"]), 0.0
+            # Grab latest news headline from Yahoo Finance
+            news = stock.news
+            if news:
+                first_item = news[0].get("content", news[0])
+                title = first_item.get("title", "")
+                if title:
+                    headlines.append(f"- {r['Name']} ({t}): {title}")
         except Exception:
             ltp, chg = float(r["Buy_Price"]), 0.0
+
         mult = fx if r["Market"] == "US" else 1.0
         cur_val = round(float(r["Qty"]) * ltp * mult, 0)
         rows.append({
@@ -127,7 +128,7 @@ def fetch_live_snapshot(df, fx):
             "Qty": r["Qty"], "Buy_Price": r["Buy_Price"],
             "Live_Price": ltp, "Day_Chg_%": chg, "Current_INR": cur_val
         })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), "\n".join(headlines[:15])
 
 st.subheader("🧠 My Personal Stock Market Analyst")
 tab1, tab2, tab3, tab4 = st.tabs([
@@ -137,6 +138,9 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "✏️ Edit Portfolio"
 ])
 
+# ==============================================================================
+# TAB 1: PURE ANALYSIS VIEW
+# ==============================================================================
 with tab1:
     user_change_note = st.text_input(
         "Mention any change in your portfolio or ask a question (optional):",
@@ -144,20 +148,24 @@ with tab1:
     )
 
     if st.button("⚡ Generate Today's Live Portfolio Analysis", type="primary", use_container_width=True):
-        with st.spinner(f"Running {model_choice} across your 23 stocks..."):
-            live_df = fetch_live_snapshot(st.session_state.portfolio, usd_inr)
+        with st.spinner(f"Fetching live NSE/US prices & running {model_choice}..."):
+            live_df, latest_news = fetch_live_snapshot_and_news(st.session_state.portfolio, usd_inr)
             prompt = f"""
             Act as my personal stock market analyst. Investment horizon: 3-5 years. Risk tolerance: High.
             Today's Date: {datetime.now().strftime('%d %b %Y')}
-            My current portfolio with live prices and INR values:
+
+            LIVE PORTFOLIO PRICES & VALUATION:
             {live_df.to_string(index=False)}
 
-            User Portfolio Update / Note: {user_change_note}
+            LATEST LIVE NEWS HEADLINES FOR MY HOLDINGS:
+            {latest_news if latest_news else "No breaking headlines in feed."}
+
+            USER PORTFOLIO NOTE: {user_change_note}
 
             Provide a clean, high-signal daily executive report with these exact sections:
-            1. Overall India & US Market Summary + Macro Drivers (Crude, USD/INR, FII flows).
+            1. Overall Portfolio Performance & Market Summary.
             2. Important News Affecting My Holdings Today.
-            3. Stock-by-Stock Action Table (Columns: Stock | Live Price & 1D % | Status (Positive/Neutral/Negative) | Action (Hold/Review/Consider Reducing) | Fundamental Trigger).
+            3. Stock-by-Stock Action Table (Columns: Stock | Live Price & 1D % | Status (Positive/Neutral/Negative) | Action (Hold/Review/Consider Reducing) | Key Trigger to Watch).
             4. Portfolio Concentration & Overlapping Theme Risk (Semiconductors/EMS, Defence, AI, Crypto proxy).
             5. Top 3 Immediate Risks & Upcoming Events to Watch.
             6. Changes to Long-Term Investment Thesis.
@@ -178,31 +186,45 @@ with tab1:
     else:
         st.info("Tap **Generate Today's Live Portfolio Analysis** above to view your clean daily report.")
 
+# ==============================================================================
+# TAB 2: STOCK RESULTS & QUARTERLY FINANCIALS
+# ==============================================================================
 with tab2:
     st.markdown("#### 📰 Quarterly Earnings, Order Books & Filings")
     tickers_list = st.session_state.portfolio["Ticker"].tolist()
     selected_stock = st.selectbox("Choose a Portfolio Stock:", tickers_list)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        check_one = st.button("🔍 Check Selected Stock", type="primary", use_container_width=True)
-    with c2:
-        check_all = st.button("⚡ Scan All 23 Results", use_container_width=True)
-
-    if check_one or check_all:
-        with st.spinner("Searching latest NSE/BSE/SEC filings, quarterly results, and order wins..."):
-            q_prompt = (
-                f"Summarize the latest quarterly financial results (revenue growth, profit, margins), order book updates, and key announcements across all my holdings: {', '.join(tickers_list)}."
-                if check_all else
-                f"Provide a deep-dive on the latest quarterly results, revenue growth, profit margins, debt, cash flow, recent order wins, and 3-5 year thesis check for {selected_stock}."
-            )
+    if st.button("🔍 Deep-Dive Selected Stock Results & News", type="primary", use_container_width=True):
+        with st.spinner(f"Pulling quarterly financials & news for {selected_stock}..."):
             try:
+                st_obj = yf.Ticker(selected_stock)
+                q_stmt = st_obj.quarterly_income_stmt
+                q_str = q_stmt.to_string() if (q_stmt is not None and not q_stmt.empty) else "Use latest known filings"
+                s_news = st_obj.news
+                news_titles = [n.get("content", n).get("title", "") for n in s_news[:5]] if s_news else []
+
+                q_prompt = f"""
+                Analyze {selected_stock} for my 3-5 year high-risk portfolio using this live data:
+                Quarterly Income Statement Data:
+                {q_str[:3000]}
+
+                Recent News Headlines:
+                {news_titles}
+
+                Provide:
+                1. Latest quarterly revenue, profit growth, and margin trajectory.
+                2. Balance sheet health, debt, and order book / business developments.
+                3. Whether the 3-5 year thesis is strengthened or weakened, and what metric would change the recommendation.
+                """
                 res_text = ask_gemini(q_prompt)
                 if res_text:
                     st.markdown(res_text)
             except Exception as e:
                 st.error(f"Error: {e}")
 
+# ==============================================================================
+# TAB 3: WHATSAPP & SMS REMINDER MANAGER
+# ==============================================================================
 with tab3:
     st.markdown("#### 📲 Manage Phone Numbers for Daily Updates")
     st.caption("Tap any cell to change a number or tap the `+` row at the bottom to add extra phone numbers.")
@@ -251,10 +273,11 @@ with tab3:
                 except Exception as e:
                     st.error(f"Failed for {num}: {e}")
 
+# ==============================================================================
+# TAB 4: EDIT PORTFOLIO HOLDINGS
+# ==============================================================================
 with tab4:
     st.markdown("#### ✏️ Update Your Portfolio Quantities & Buy Prices")
-    st.caption("Whenever you buy or sell a stock, update it here and tap **Save Portfolio**. Tab 1 will automatically analyze your updated holdings.")
-
     edited_port = st.data_editor(
         st.session_state.portfolio,
         num_rows="dynamic",
