@@ -10,6 +10,7 @@ import random
 import urllib.parse
 from datetime import datetime
 import pytz
+import requests
 
 st.set_page_config(
     page_title="Universal AI Stock Analyst Hub",
@@ -26,13 +27,12 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users (
                     username TEXT PRIMARY KEY, 
-                    email TEXT,
-                    phone TEXT UNIQUE,
+                    email TEXT UNIQUE,
+                    phone TEXT,
                     password_hash TEXT, 
                     reset_code TEXT
                 )''')
     
-    # Safely check if 'phone' column exists, if not add it
     c.execute("PRAGMA table_info(users)")
     columns = [col[1] for col in c.fetchall()]
     if "phone" not in columns:
@@ -87,7 +87,7 @@ def register_user(username, email, phone, password):
         return True, "Success"
     except sqlite3.IntegrityError:
         conn.close()
-        return False, "Username or Phone number already registered."
+        return False, "Username or Email already registered."
 
 def verify_user_credentials(identifier, password):
     conn = sqlite3.connect(DB_FILE)
@@ -108,12 +108,34 @@ def get_username_by_phone(phone):
     conn.close()
     return row[0] if row else None
 
-# --- BYPASSED OTP GENERATOR (NO TWILIO REQUIRED) ---
+def get_or_create_google_user(email):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    mail = email.lower().strip()
+    c.execute("SELECT username FROM users WHERE email = ?", (mail,))
+    row = c.fetchone()
+    if row:
+        conn.close()
+        return row[0]
+    
+    uname = mail.split("@")[0] + "_" + str(random.randint(100, 999))
+    c.execute("INSERT INTO users (username, email, phone, password_hash, reset_code) VALUES (?, ?, ?, ?, ?)",
+              (uname, mail, "", hash_password(str(random.randint(100000, 999999))), ""))
+    
+    default_stocks = [
+        ("AVANTEL.NS", "Avantel", "IN", "Defence", 100, 150.0),
+        ("NVDA", "NVIDIA", "US", "Semicon & AI", 20, 120.0)
+    ]
+    for s in default_stocks:
+        c.execute("INSERT OR REPLACE INTO portfolios VALUES (?, ?, ?, ?, ?, ?, ?)", (uname, *s))
+    conn.commit()
+    conn.close()
+    return uname
+
 def send_otp_bypassed(phone_number):
     code = str(random.randint(100000, 999999))
     return True, code
 
-# --- DATABASE LOAD/SAVE HELPERS ---
 def load_user_portfolio(username):
     conn = sqlite3.connect(DB_FILE)
     df = pd.read_sql("SELECT ticker as Ticker, name as Name, market as Market, theme as Theme, qty as Qty, buy_price as Buy_Price FROM portfolios WHERE username = ?", conn, params=(username,))
@@ -151,7 +173,7 @@ def save_user_contacts(username, df):
     conn.commit()
     conn.close()
 
-# --- 2. AUTHENTICATION & PORTAL GATEWAY ---
+# --- 2. AUTHENTICATION & OAUTH GATEWAY ---
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.username = ""
@@ -161,14 +183,54 @@ if "otp_sent" not in st.session_state:
     st.session_state.pending_phone = ""
     st.session_state.generated_otp = ""
 
+query_params = st.query_params
+if "code" in query_params and not st.session_state.logged_in:
+    code = query_params["code"]
+    try:
+        g_conf = st.secrets.get("google_auth", {})
+        token_res = requests.post("https://oauth2.googleapis.com/token", data={
+            "code": code,
+            "client_id": g_conf.get("client_id", ""),
+            "client_secret": g_conf.get("client_secret", ""),
+            "redirect_uri": g_conf.get("redirect_uri", ""),
+            "grant_type": "authorization_code"
+        }).json()
+        access_token = token_res.get("access_token")
+        if access_token:
+            user_info = requests.get("https://www.googleapis.com/oauth2/v2/userinfo", headers={"Authorization": f"Bearer {access_token}"}).json()
+            email = user_info.get("email")
+            if email:
+                uname = get_or_create_google_user(email)
+                st.session_state.logged_in = True
+                st.session_state.username = uname
+                st.query_params.clear()
+                st.rerun()
+    except Exception as e:
+        st.error(f"Google Login Error: {e}")
+
 if not st.session_state.logged_in:
     st.title("🔐 Universal AI Stock Analyst Hub")
     
-    auth_tab1, auth_tab2 = st.tabs(["🔑 Login (Password or Phone OTP)", "📝 Register with Phone OTP"])
+    auth_tab1, auth_tab2, auth_tab3 = st.tabs(["🌐 Google & Password Login", "📱 Phone OTP Login", "📝 Register New Account"])
 
     with auth_tab1:
-        st.subheader("Sign In")
-        login_id = st.text_input("Username, Email, or Phone Number", key="log_id")
+        st.subheader("Sign In with Google or Password")
+        
+        g_conf = st.secrets.get("google_auth", {})
+        if g_conf.get("client_id"):
+            google_login_url = (
+                f"https://accounts.google.com/o/oauth2/v2/auth?"
+                f"client_id={g_conf['client_id']}&"
+                f"redirect_uri={urllib.parse.quote(g_conf['redirect_uri'])}&"
+                f"response_type=code&"
+                f"scope=openid%20email%20profile"
+            )
+            st.link_button("🌐 Continue with Google Account", google_login_url, use_container_width=True)
+        else:
+            st.info("Google OAuth is optional (configure `google_auth` in Secrets to enable).")
+
+        st.divider()
+        login_id = st.text_input("Username or Email", key="log_id")
         login_pw = st.text_input("Password", type="password", key="log_pw")
 
         if st.button("Log In with Password", type="primary", use_container_width=True):
@@ -180,9 +242,9 @@ if not st.session_state.logged_in:
             else:
                 st.error("Invalid credentials.")
 
-        st.divider()
-        st.markdown("##### Or Sign In via Phone OTP")
-        phone_login = st.text_input("Enter Mobile Number (e.g., +918106667450)")
+    with auth_tab2:
+        st.subheader("Sign In via Mobile OTP")
+        phone_login = st.text_input("Enter Registered Mobile Number (e.g., +918106667450)")
         
         if st.button("Generate Login OTP"):
             uname = get_username_by_phone(phone_login)
@@ -192,7 +254,7 @@ if not st.session_state.logged_in:
                 st.session_state.pending_phone = phone_login
                 st.session_state.generated_otp = code
                 st.session_state.login_target_user = uname
-                st.success(f"Verification Code Generated: **{code}** (Enter this below)")
+                st.success(f"Verification Code Generated: **{code}** (Enter below)")
             else:
                 st.error("Phone number not registered.")
 
@@ -207,8 +269,8 @@ if not st.session_state.logged_in:
                 else:
                     st.error("Incorrect OTP code.")
 
-    with auth_tab2:
-        st.subheader("Create Account with Phone Verification")
+    with auth_tab3:
+        st.subheader("Create a New Account")
         r_user = st.text_input("Choose Username").strip().lower()
         r_email = st.text_input("Email Address").strip().lower()
         r_phone = st.text_input("Mobile Number (+91...)").strip()
@@ -220,7 +282,7 @@ if not st.session_state.logged_in:
                 st.session_state.reg_otp_sent = True
                 st.session_state.reg_code = code
                 st.session_state.reg_data = (r_user, r_email, r_phone, r_pw)
-                st.success(f"Verification Code Generated: **{code}** (Enter this below)")
+                st.success(f"Verification Code Generated: **{code}** (Enter below)")
             else:
                 st.warning("Fill in Username, Phone, and Password.")
 
@@ -395,4 +457,3 @@ with tab_edit:
         save_user_portfolio(username, edited_port)
         st.cache_data.clear()
         st.success("Saved!")
-        
