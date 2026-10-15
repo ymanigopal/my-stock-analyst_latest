@@ -257,7 +257,6 @@ with tab_res:
     tickers = st.session_state.portfolio["Ticker"].tolist()
     sel_ticker = st.selectbox("Select Stock to Analyze:", tickers)
     
-    # Quick metadata lookup
     match_row = st.session_state.portfolio[st.session_state.portfolio["Ticker"] == sel_ticker]
     stock_name = match_row["Name"].values[0] if not match_row.empty else sel_ticker
 
@@ -269,27 +268,25 @@ with tab_res:
                 q_stmt = stock_obj.quarterly_income_stmt
                 q_str = q_stmt.to_string() if (q_stmt is not None and not q_stmt.empty) else "Quarterly data unavailable."
                 
-                # Extract basic metrics from yahoo info if present
                 pe_ratio = info.get("trailingPE", "N/A")
                 pb_ratio = info.get("priceToBook", "N/A")
                 market_cap = info.get("marketCap", "N/A")
                 div_yield = info.get("dividendYield", "N/A")
-                52w_high = info.get("fiftyTwoWeekHigh", "N/A")
-                52w_low = info.get("fiftyTwoWeekLow", "N/A")
+                high_52w = info.get("fiftyTwoWeekHigh", "N/A")
+                low_52w = info.get("fiftyTwoWeekLow", "N/A")
                 
                 news_list = stock_obj.news
                 news_text = ""
                 if news_list:
                     for n in news_list[:5]:
                         title = n.get("content", n).get("title", "No title")
-                        pub = n.get("content", n).get("providerPublishTime", "")
                         news_text += f"- {title}\n"
                 else:
                     news_text = "No recent breaking updates found."
 
             except Exception as e:
                 q_str = "Error loading financials."
-                pe_ratio, pb_ratio, market_cap, div_yield, 52w_high, 52w_low = "N/A", "N/A", "N/A", "N/A", "N/A", "N/A"
+                pe_ratio, pb_ratio, market_cap, div_yield, high_52w, low_52w = "N/A", "N/A", "N/A", "N/A", "N/A", "N/A"
                 news_text = "Error fetching news."
 
             screener_prompt = f"""
@@ -300,7 +297,7 @@ with tab_res:
             - Price-to-Book: {pb_ratio}
             - Market Cap: {market_cap}
             - Dividend Yield: {div_yield}
-            - 52-Week High/Low: {52w_high} / {52w_low}
+            - 52-Week High/Low: {high_52w} / {low_52w}
             
             Recent Quarterly Financial Statement Snippet:
             {q_str[:3000]}
