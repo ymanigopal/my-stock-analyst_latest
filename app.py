@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 from google import genai
-from twilio.rest import Client
 import json
 import os
 import sqlite3
@@ -11,7 +10,6 @@ import random
 import urllib.parse
 from datetime import datetime
 import pytz
-import requests
 
 st.set_page_config(
     page_title="Universal AI Stock Analyst Hub",
@@ -22,7 +20,7 @@ st.set_page_config(
 
 DB_FILE = "universal_users.db"
 
-# --- 1. DATABASE SETUP (WITH PHONE SUPPORT) ---
+# --- 1. DATABASE SETUP ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -33,6 +31,13 @@ def init_db():
                     password_hash TEXT, 
                     reset_code TEXT
                 )''')
+    
+    # Safely check if 'phone' column exists, if not add it
+    c.execute("PRAGMA table_info(users)")
+    columns = [col[1] for col in c.fetchall()]
+    if "phone" not in columns:
+        c.execute("ALTER TABLE users ADD COLUMN phone TEXT")
+
     c.execute('''CREATE TABLE IF NOT EXISTS portfolios (
                     username TEXT,
                     ticker TEXT,
@@ -103,23 +108,10 @@ def get_username_by_phone(phone):
     conn.close()
     return row[0] if row else None
 
-# --- TWILIO OTP SENDER HELPER ---
-def send_otp_via_twilio(phone_number, otp_code):
-    sid = st.secrets.get("TWILIO_SID", "")
-    token = st.secrets.get("TWILIO_TOKEN", "")
-    from_sms = st.secrets.get("TWILIO_SMS_FROM", "")
-    if not sid or not token:
-        return False, "Twilio credentials missing in Streamlit Secrets."
-    try:
-        client = Client(sid, token)
-        msg = client.messages.create(
-            body=f"Your AI Stock Analyst Verification Code is: {otp_code}",
-            from_=from_sms,
-            to=phone_number
-        )
-        return True, msg.sid
-    except Exception as e:
-        return False, str(e)
+# --- BYPASSED OTP GENERATOR (NO TWILIO REQUIRED) ---
+def send_otp_bypassed(phone_number):
+    code = str(random.randint(100000, 999999))
+    return True, code
 
 # --- DATABASE LOAD/SAVE HELPERS ---
 def load_user_portfolio(username):
@@ -168,7 +160,6 @@ if "otp_sent" not in st.session_state:
     st.session_state.otp_sent = False
     st.session_state.pending_phone = ""
     st.session_state.generated_otp = ""
-    st.session_state.pending_reg_data = None
 
 if not st.session_state.logged_in:
     st.title("🔐 Universal AI Stock Analyst Hub")
@@ -190,27 +181,23 @@ if not st.session_state.logged_in:
                 st.error("Invalid credentials.")
 
         st.divider()
-        st.markdown("##### Or Sign In / Recover via Phone OTP")
-        phone_login = st.text_input("Enter Mobile Number (e.g., +919876543210)")
+        st.markdown("##### Or Sign In via Phone OTP")
+        phone_login = st.text_input("Enter Mobile Number (e.g., +918106667450)")
         
-        if st.button("Send Login OTP via SMS"):
+        if st.button("Generate Login OTP"):
             uname = get_username_by_phone(phone_login)
             if uname:
-                code = str(random.randint(100000, 999999))
-                success, info = send_otp_via_twilio(phone_login, code)
-                if success:
-                    st.session_state.otp_sent = True
-                    st.session_state.pending_phone = phone_login
-                    st.session_state.generated_otp = code
-                    st.session_state.login_target_user = uname
-                    st.success(f"OTP sent to {phone_login}! (Demo OTP: {code})")
-                else:
-                    st.error(f"Failed to send SMS: {info}")
+                success, code = send_otp_bypassed(phone_login)
+                st.session_state.otp_sent = True
+                st.session_state.pending_phone = phone_login
+                st.session_state.generated_otp = code
+                st.session_state.login_target_user = uname
+                st.success(f"Verification Code Generated: **{code}** (Enter this below)")
             else:
                 st.error("Phone number not registered.")
 
         if st.session_state.otp_sent and st.session_state.pending_phone:
-            entered_otp = st.text_input("Enter 6-Digit OTP Code received via SMS")
+            entered_otp = st.text_input("Enter 6-Digit OTP Code")
             if st.button("Verify & Log In", type="primary"):
                 if entered_otp.strip() == st.session_state.generated_otp:
                     st.session_state.logged_in = True
@@ -227,17 +214,13 @@ if not st.session_state.logged_in:
         r_phone = st.text_input("Mobile Number (+91...)").strip()
         r_pw = st.text_input("Choose Password", type="password", key="r_pw")
 
-        if st.button("Send Verification OTP", type="primary", use_container_width=True):
+        if st.button("Generate Verification OTP", type="primary", use_container_width=True):
             if r_user and r_phone and r_pw:
-                code = str(random.randint(100000, 999999))
-                success, info = send_otp_via_twilio(r_phone, code)
-                if success:
-                    st.session_state.reg_otp_sent = True
-                    st.session_state.reg_code = code
-                    st.session_state.reg_data = (r_user, r_email, r_phone, r_pw)
-                    st.success(f"OTP sent to {r_phone}! (Demo Code: {code})")
-                else:
-                    st.error(f"SMS Error: {info}")
+                success, code = send_otp_bypassed(r_phone)
+                st.session_state.reg_otp_sent = True
+                st.session_state.reg_code = code
+                st.session_state.reg_data = (r_user, r_email, r_phone, r_pw)
+                st.success(f"Verification Code Generated: **{code}** (Enter this below)")
             else:
                 st.warning("Fill in Username, Phone, and Password.")
 
@@ -412,39 +395,4 @@ with tab_edit:
         save_user_portfolio(username, edited_port)
         st.cache_data.clear()
         st.success("Saved!")
-
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-                    username TEXT PRIMARY KEY, 
-                    email TEXT,
-                    password_hash TEXT, 
-                    reset_code TEXT
-                )''')
-    
-    # Safely check if 'phone' column exists, if not add it
-    c.execute("PRAGMA table_info(users)")
-    columns = [col[1] for col in c.fetchall()]
-    if "phone" not in columns:
-        c.execute("ALTER TABLE users ADD COLUMN phone TEXT")
-
-    c.execute('''CREATE TABLE IF NOT EXISTS portfolios (
-                    username TEXT,
-                    ticker TEXT,
-                    name TEXT,
-                    market TEXT,
-                    theme TEXT,
-                    qty REAL,
-                    buy_price REAL,
-                    PRIMARY KEY (username, ticker)
-                )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS contacts (
-                    username TEXT,
-                    name TEXT,
-                    phone TEXT,
-                    active INTEGER,
-                    PRIMARY KEY (username, phone)
-                )''')
-    conn.commit()
-    conn.close()
+        
