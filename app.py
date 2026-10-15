@@ -2,245 +2,48 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 from google import genai
+from twilio.rest import Client
 import json
 import os
-import sqlite3
-import hashlib
-import random
 import urllib.parse
 from datetime import datetime
 import pytz
 
 st.set_page_config(
-    page_title="Universal AI Stock Analyst Hub",
+    page_title="My AI Stock Analyst Hub",
     page_icon="📈",
     layout="centered",
     initial_sidebar_state="collapsed"
 )
 
-DB_FILE = "universal_users.db"
+PORTFOLIO_FILE = "my_portfolio.json"
+CONTACTS_FILE = "phone_numbers.json"
 
-# --- 1. DATABASE SETUP ---
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-                    username TEXT PRIMARY KEY, 
-                    email TEXT UNIQUE,
-                    phone TEXT,
-                    password_hash TEXT, 
-                    reset_code TEXT
-                )''')
-    
-    c.execute("PRAGMA table_info(users)")
-    columns = [col[1] for col in c.fetchall()]
-    if "phone" not in columns:
-        c.execute("ALTER TABLE users ADD COLUMN phone TEXT")
-
-    c.execute('''CREATE TABLE IF NOT EXISTS portfolios (
-                    username TEXT,
-                    ticker TEXT,
-                    name TEXT,
-                    market TEXT,
-                    theme TEXT,
-                    qty REAL,
-                    buy_price REAL,
-                    PRIMARY KEY (username, ticker)
-                )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS contacts (
-                    username TEXT,
-                    name TEXT,
-                    phone TEXT,
-                    active INTEGER,
-                    PRIMARY KEY (username, phone)
-                )''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def register_user(username, email, phone, password):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    try:
-        uname = username.lower().strip()
-        mail = email.lower().strip()
-        phn = phone.strip()
-        c.execute("INSERT INTO users (username, email, phone, password_hash, reset_code) VALUES (?, ?, ?, ?, ?)",
-                  (uname, mail, phn, hash_password(password), ""))
-        
-        default_stocks = [
-            ("AVANTEL.NS", "Avantel", "IN", "Defence", 100, 150.0),
-            ("BDL.NS", "Bharat Dynamics", "IN", "Defence", 50, 1200.0),
-            ("CAMS.NS", "CAMS", "IN", "Fin Services", 20, 3500.0),
-            ("CDSL.NS", "CDSL", "IN", "Fin Services", 50, 1400.0),
-            ("NVDA", "NVIDIA", "US", "Semicon & AI", 20, 120.0)
-        ]
-        for s in default_stocks:
-            c.execute("INSERT OR REPLACE INTO portfolios VALUES (?, ?, ?, ?, ?, ?, ?)", (uname, *s))
-        conn.commit()
-        conn.close()
-        return True, "Success"
-    except sqlite3.IntegrityError:
-        conn.close()
-        return False, "Username, Email, or Phone already registered."
-
-def verify_user_credentials(identifier, password):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    iden = identifier.lower().strip()
-    c.execute("SELECT username, password_hash FROM users WHERE username = ? OR email = ? OR phone = ?", (iden, iden, iden))
-    row = c.fetchone()
-    conn.close()
-    if row and row[1] == hash_password(password):
-        return row[0]
-    return None
-
-def get_username_by_phone(phone):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT username FROM users WHERE phone = ?", (phone.strip(),))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def send_otp_bypassed(phone_number):
-    code = str(random.randint(100000, 999999))
-    return True, code
-
-def load_user_portfolio(username):
-    conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql("SELECT ticker as Ticker, name as Name, market as Market, theme as Theme, qty as Qty, buy_price as Buy_Price FROM portfolios WHERE username = ?", conn, params=(username,))
-    conn.close()
-    if df.empty:
-        return pd.DataFrame(columns=["Ticker", "Name", "Market", "Theme", "Qty", "Buy_Price"])
-    return df
-
-def save_user_portfolio(username, df):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("DELETE FROM portfolios WHERE username = ?", (username,))
-    for _, r in df.iterrows():
-        c.execute("INSERT OR REPLACE INTO portfolios VALUES (?, ?, ?, ?, ?, ?, ?)",
-                  (username, str(r["Ticker"]), str(r.get("Name", r["Ticker"])), str(r.get("Market", "IN")), str(r.get("Theme", "Growth")), float(r["Qty"]), float(r["Buy_Price"])))
-    conn.commit()
-    conn.close()
-
-def load_user_contacts(username):
-    conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql("SELECT name as Name, phone as Phone, active as Active FROM contacts WHERE username = ?", conn, params=(username,))
-    conn.close()
-    if df.empty:
-        return pd.DataFrame([{"Name": "Primary", "Phone": "+919876543210", "Active": True}])
-    df["Active"] = df["Active"].astype(bool)
-    return df
-
-def save_user_contacts(username, df):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("DELETE FROM contacts WHERE username = ?", (username,))
-    for _, r in df.iterrows():
-        c.execute("INSERT OR REPLACE INTO contacts VALUES (?, ?, ?, ?)",
-                  (username, str(r["Name"]), str(r["Phone"]), int(r["Active"])))
-    conn.commit()
-    conn.close()
-
-# --- 2. AUTHENTICATION GATEWAY ---
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.username = ""
-
-if "otp_sent" not in st.session_state:
-    st.session_state.otp_sent = False
-    st.session_state.pending_phone = ""
-    st.session_state.generated_otp = ""
-
-if not st.session_state.logged_in:
-    st.title("🔐 Universal AI Stock Analyst Hub")
-    
-    auth_tab1, auth_tab2, auth_tab3 = st.tabs(["🔑 Password Login", "📱 Mobile OTP Login", "📝 Register New Account"])
-
-    with auth_tab1:
-        st.subheader("Sign In with Password")
-        login_id = st.text_input("Username, Email, or Phone", key="log_id")
-        login_pw = st.text_input("Password", type="password", key="log_pw")
-
-        if st.button("Log In", type="primary", use_container_width=True):
-            uname = verify_user_credentials(login_id, login_pw)
-            if uname:
-                st.session_state.logged_in = True
-                st.session_state.username = uname
-                st.rerun()
-            else:
-                st.error("Invalid credentials.")
-
-    with auth_tab2:
-        st.subheader("Sign In via Mobile Verification Code")
-        phone_login = st.text_input("Enter Registered Mobile Number (e.g., +918106667450)")
-        
-        if st.button("Generate Login OTP"):
-            uname = get_username_by_phone(phone_login)
-            if uname:
-                success, code = send_otp_bypassed(phone_login)
-                st.session_state.otp_sent = True
-                st.session_state.pending_phone = phone_login
-                st.session_state.generated_otp = code
-                st.session_state.login_target_user = uname
-                st.success(f"Verification Code Generated: **{code}** (Enter below)")
-            else:
-                st.error("Phone number not registered.")
-
-        if st.session_state.otp_sent and st.session_state.pending_phone:
-            entered_otp = st.text_input("Enter 6-Digit OTP Code")
-            if st.button("Verify & Log In", type="primary"):
-                if entered_otp.strip() == st.session_state.generated_otp:
-                    st.session_state.logged_in = True
-                    st.session_state.username = st.session_state.login_target_user
-                    st.session_state.otp_sent = False
-                    st.rerun()
-                else:
-                    st.error("Incorrect OTP code.")
-
-    with auth_tab3:
-        st.subheader("Create a New Universal Account")
-        r_user = st.text_input("Choose Username").strip().lower()
-        r_email = st.text_input("Email Address").strip().lower()
-        r_phone = st.text_input("Mobile Number (+91...)").strip()
-        r_pw = st.text_input("Choose Password", type="password", key="r_pw")
-
-        if st.button("Generate Verification OTP", type="primary", use_container_width=True):
-            if r_user and r_phone and r_pw:
-                success, code = send_otp_bypassed(r_phone)
-                st.session_state.reg_otp_sent = True
-                st.session_state.reg_code = code
-                st.session_state.reg_data = (r_user, r_email, r_phone, r_pw)
-                st.success(f"Verification Code Generated: **{code}** (Enter below)")
-            else:
-                st.warning("Fill in Username, Phone, and Password.")
-
-        if st.session_state.get("reg_otp_sent", False):
-            reg_entered_otp = st.text_input("Enter Registration OTP")
-            if st.button("Verify & Complete Registration"):
-                if reg_entered_otp.strip() == st.session_state.reg_code:
-                    u, e, p, pwd = st.session_state.reg_data
-                    success, msg = register_user(u, e, p, pwd)
-                    if success:
-                        st.success("Account successfully created! You can now log in.")
-                        st.session_state.reg_otp_sent = False
-                    else:
-                        st.error(msg)
-                else:
-                    st.error("Invalid verification code.")
-
-    st.stop()
-
-# --- 3. LOGGED-IN UNIVERSAL DASHBOARD ---
-username = st.session_state.username
-user_portfolio_df = load_user_portfolio(username)
-user_contacts_df = load_user_contacts(username)
+DEFAULT_PORTFOLIO = [
+    {"Ticker": "AVANTEL.NS", "Name": "Avantel", "Market": "IN", "Theme": "Defence", "Qty": 100, "Buy_Price": 150.0},
+    {"Ticker": "BDL.NS", "Name": "Bharat Dynamics", "Market": "IN", "Theme": "Defence", "Qty": 50, "Buy_Price": 1200.0},
+    {"Ticker": "CAMS.NS", "Name": "CAMS", "Market": "IN", "Theme": "Fin Services", "Qty": 20, "Buy_Price": 3500.0},
+    {"Ticker": "CDSL.NS", "Name": "CDSL", "Market": "IN", "Theme": "Fin Services", "Qty": 50, "Buy_Price": 1400.0},
+    {"Ticker": "KAYNES.NS", "Name": "Kaynes Tech", "Market": "IN", "Theme": "Semicon & EMS", "Qty": 15, "Buy_Price": 4200.0},
+    {"Ticker": "KPITTECH.NS", "Name": "KPIT Tech", "Market": "IN", "Theme": "Auto Tech", "Qty": 40, "Buy_Price": 1500.0},
+    {"Ticker": "LEMONTREE.NS", "Name": "Lemon Tree", "Market": "IN", "Theme": "Hotels", "Qty": 200, "Buy_Price": 130.0},
+    {"Ticker": "MOSCHIP.NS", "Name": "MosChip Tech", "Market": "IN", "Theme": "Semicon & EMS", "Qty": 150, "Buy_Price": 210.0},
+    {"Ticker": "OLAELEC.NS", "Name": "Ola Electric", "Market": "IN", "Theme": "EV / Auto", "Qty": 200, "Buy_Price": 95.0},
+    {"Ticker": "PGEL.NS", "Name": "PG Electroplast", "Market": "IN", "Theme": "Semicon & EMS", "Qty": 80, "Buy_Price": 600.0},
+    {"Ticker": "TATACAP.NS", "Name": "Tata Capital", "Market": "IN", "Theme": "NBFC / Fin", "Qty": 100, "Buy_Price": 350.0},
+    {"Ticker": "VAML.NS", "Name": "Vedanta Aluminium", "Market": "IN", "Theme": "Commodities", "Qty": 100, "Buy_Price": 280.0},
+    {"Ticker": "VBL.NS", "Name": "Varun Beverages", "Market": "IN", "Theme": "Consumer", "Qty": 60, "Buy_Price": 600.0},
+    {"Ticker": "VEDL.NS", "Name": "Vedanta Ltd", "Market": "IN", "Theme": "Commodities", "Qty": 100, "Buy_Price": 450.0},
+    {"Ticker": "DIXON.NS", "Name": "Dixon Tech", "Market": "IN", "Theme": "Semicon & EMS", "Qty": 10, "Buy_Price": 12000.0},
+    {"Ticker": "EIHOTEL.NS", "Name": "EIH Oberoi", "Market": "IN", "Theme": "Hotels", "Qty": 80, "Buy_Price": 380.0},
+    {"Ticker": "ETERNAL.NS", "Name": "Eternal (Zomato)", "Market": "IN", "Theme": "Quick Commerce", "Qty": 250, "Buy_Price": 240.0},
+    {"Ticker": "HAL.NS", "Name": "HAL", "Market": "IN", "Theme": "Defence", "Qty": 25, "Buy_Price": 4200.0},
+    {"Ticker": "INDIGO.NS", "Name": "IndiGo", "Market": "IN", "Theme": "Aviation", "Qty": 15, "Buy_Price": 4300.0},
+    {"Ticker": "KALYANKJIL.NS", "Name": "Kalyan Jewellers", "Market": "IN", "Theme": "Consumer", "Qty": 60, "Buy_Price": 550.0},
+    {"Ticker": "MSTR", "Name": "Strategy Inc", "Market": "US", "Theme": "Crypto Proxy", "Qty": 10, "Buy_Price": 180.0},
+    {"Ticker": "ACN", "Name": "Accenture", "Market": "US", "Theme": "IT / AI Services", "Qty": 8, "Buy_Price": 330.0},
+    {"Ticker": "NVDA", "Name": "NVIDIA", "Market": "US", "Theme": "Semicon & AI", "Qty": 20, "Buy_Price": 120.0}
+]
 
 GLOBAL_INDICES = {
     "Nifty 50": "^NSEI", "BSE Sensex": "^BSESN", "Bank Nifty": "^NSEBANK",
@@ -248,18 +51,39 @@ GLOBAL_INDICES = {
     "Brent Crude ($)": "BZ=F", "Gold ($/oz)": "GC=F", "USD/INR (₹)": "INR=X"
 }
 
+def load_json(file_path, default_data):
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return default_data
+    return default_data
+
+def save_json(file_path, data):
+    with open(file_path, "w") as f:
+        json.dump(data, f, indent=4)
+
+if "portfolio" not in st.session_state:
+    st.session_state.portfolio = pd.DataFrame(load_json(PORTFOLIO_FILE, DEFAULT_PORTFOLIO))
+
+if "contacts" not in st.session_state:
+    st.session_state.contacts = load_json(CONTACTS_FILE, [
+        {"Name": "Primary Number", "Phone": "+918106667450", "Active": True}
+    ])
+
 with st.sidebar:
-    st.markdown(f"👤 Logged in as: **{username.capitalize()}**")
-    if st.button("Log Out"):
-        st.session_state.logged_in = False
-        st.session_state.username = ""
-        st.rerun()
-        
-    st.divider()
     st.header("🔑 API Settings")
-    gemini_key = st.text_input("Gemini API Key", value=st.secrets.get("GEMINI_API_KEY", ""), type="password")
+    default_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
+    gemini_key = st.text_input("Gemini API Key", value=default_key, type="password")
     model_choice = st.selectbox("Gemini Model", ["gemini-3.8-flash", "gemini-3.1-flash-lite"])
     usd_inr = st.number_input("USD/INR Rate (₹)", value=88.75, step=0.1)
+
+    st.divider()
+    st.subheader("Twilio Settings")
+    twilio_sid = st.text_input("Twilio SID", value=st.secrets.get("TWILIO_SID", "") if hasattr(st, "secrets") else "")
+    twilio_token = st.text_input("Twilio Auth Token", value=st.secrets.get("TWILIO_TOKEN", "") if hasattr(st, "secrets") else "", type="password")
+    twilio_from = st.text_input("Twilio From Number", value=st.secrets.get("TWILIO_SMS_FROM", "+1234567890"))
 
 def ask_gemini(prompt_text):
     clean_key = gemini_key.strip()
@@ -318,42 +142,55 @@ def fetch_user_stock_snapshot(df, fx):
     return pd.DataFrame(rows), "\n".join(headlines[:20])
 
 ist_now = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%d %b %Y, %I:%M %p IST")
-st.subheader("📈 Universal AI Portfolio & Market Hub")
+st.subheader("🧠 Personal Stock Market Analyst Hub")
+st.caption(f"Live Data Timestamp: {ist_now}")
 
 tab_mkt, tab_sync, tab_port, tab_res, tab_wa, tab_edit = st.tabs([
     "🌐 Market Update",
     "🔗 Broker Sync",
     "📊 My Portfolio",
     "📰 Stock Results",
-    "📲 WhatsApp",
+    "📲 WhatsApp/SMS",
     "✏️ Edit Stocks"
 ])
 
 with tab_mkt:
-    st.markdown("#### 🌐 Dynamic Market Update (Tailored to Your Portfolio)")
-    if st.button("🚀 Generate Market & Dynamic Portfolio Report", type="primary", use_container_width=True):
-        with st.spinner("Fetching live market data and analyzing your specific holdings..."):
+    st.markdown("#### 🌐 Daily Market Update & Portfolio Analysis")
+    if st.button("🚀 Generate Today's Comprehensive Market & Portfolio Report", type="primary", use_container_width=True):
+        with st.spinner("Fetching live market data and analyzing your 23 stocks..."):
             bench_df = fetch_global_benchmarks()
-            live_df, latest_news = fetch_user_stock_snapshot(user_portfolio_df, usd_inr)
-            dynamic_prompt = f"""
-            Act as a professional Indian stock-market research analyst for user '{username}'.
-            Current Timestamp: {ist_now}.
-            Global Benchmarks:\n{bench_df.to_string(index=False)}
-            User Portfolio:\n{live_df.to_string(index=False)}
-            News:\n{latest_news}
-            Provide a comprehensive market report tailored to these exact holdings with an action table and a 90-word WhatsApp summary under '### WHATSAPP_DIGEST'.
+            live_df, latest_news = fetch_user_stock_snapshot(st.session_state.portfolio, usd_inr)
+            prompt = f"""
+            Act as my professional Indian stock-market research analyst.
+            Current Timestamp: {ist_now}. Investment Horizon: 3-5 Years. Risk Tolerance: High.
+
+            1. GLOBAL & INDIAN BENCHMARKS:
+            {bench_df.to_string(index=False)}
+
+            2. MY 23 PORTFOLIO HOLDINGS & LIVE PRICES:
+            {live_df.to_string(index=False)}
+
+            3. LATEST NEWS FOR MY HOLDINGS:
+            {latest_news if latest_news else "No breaking feed headlines."}
+
+            Prepare a comprehensive market report covering:
+            1. Indian & Global Market Overview (Sensex, Nifty, VIX, Crude, USD/INR).
+            2. Sector-Wise Analysis.
+            3. Portfolio Risk Assessment & Stock Action Table.
+            4. Tomorrow's Outlook & Checklist.
+            5. At the end under '### WHATSAPP_DIGEST', write a 90-word WhatsApp summary.
             """
-            rep = ask_gemini(dynamic_prompt)
+            rep = ask_gemini(prompt)
             if rep:
                 parts = rep.split("### WHATSAPP_DIGEST")
-                st.session_state.user_market_report = parts[0].strip()
+                st.session_state.daily_market_report = parts[0].strip()
                 if len(parts) > 1:
-                    st.session_state.wa_digest = f"📊 *Report for {username} ({ist_now})*\n\n" + parts[1].strip()
+                    st.session_state.wa_digest = f"📊 *Portfolio Update ({ist_now})*\n\n" + parts[1].strip()
 
-    if "user_market_report" in st.session_state:
-        st.markdown(st.session_state.user_market_report)
+    if "daily_market_report" in st.session_state:
+        st.markdown(st.session_state.daily_market_report)
     else:
-        st.info("Tap the button above to generate your customized market update.")
+        st.info("Tap the button above to generate today's report.")
 
 with tab_sync:
     st.markdown("#### 🔗 Link Your Demat / Broker Account")
@@ -364,31 +201,37 @@ with tab_sync:
         st.success("Successfully connected to broker API!")
 
 with tab_port:
-    live_df, _ = fetch_user_stock_snapshot(user_portfolio_df, usd_inr)
+    live_df, _ = fetch_user_stock_snapshot(st.session_state.portfolio, usd_inr)
     if not live_df.empty:
-        st.metric("Total Valuation", f"₹{live_df['Current_INR'].sum():,.0f}")
+        st.metric("Total Portfolio Valuation", f"₹{live_df['Current_INR'].sum():,.0f}")
         st.dataframe(live_df, use_container_width=True, hide_index=True)
 
 with tab_res:
-    tickers = user_portfolio_df["Ticker"].tolist()
-    if tickers:
-        sel = st.selectbox("Stock:", tickers)
-        if st.button("🔍 Deep-Dive Results"):
-            st.markdown(ask_gemini(f"Analyze financials for {sel}"))
+    tickers = st.session_state.portfolio["Ticker"].tolist()
+    sel = st.selectbox("Choose Stock:", tickers)
+    if st.button("🔍 Deep-Dive Earnings & Filings"):
+        st_obj = yf.Ticker(sel)
+        q_stmt = st_obj.quarterly_income_stmt
+        q_str = q_stmt.to_string() if (q_stmt is not None and not q_stmt.empty) else "N/A"
+        st.markdown(ask_gemini(f"Analyze financials for {sel}:\n{q_str[:2500]}"))
 
 with tab_wa:
-    edited_contacts = st.data_editor(user_contacts_df, num_rows="dynamic", use_container_width=True)
+    edited_contacts = st.data_editor(pd.DataFrame(st.session_state.contacts), num_rows="dynamic", use_container_width=True)
     if st.button("💾 Save Contacts"):
-        save_user_contacts(username, edited_contacts)
+        st.session_state.contacts = edited_contacts.to_dict(orient="records")
+        save_json(CONTACTS_FILE, st.session_state.contacts)
         st.success("Saved!")
-    msg = st.text_area("Message:", value=st.session_state.get("wa_digest", ""))
-    if not user_contacts_df.empty:
-        ph = str(user_contacts_df.iloc[0]["Phone"]).strip()
-        st.link_button("💬 Open in WhatsApp", f"https://wa.me/{ ''.join(filter(str.isdigit, ph)) }?text={urllib.parse.quote(msg)}", use_container_width=True)
+    msg = st.text_area("Message:", value=st.session_state.get("wa_digest", "Portfolio Update"))
+    active_nums = [str(c["Phone"]).strip() for c in st.session_state.contacts if c.get("Active", True)]
+    if active_nums:
+        clean_ph = "".join(filter(str.isdigit, active_nums[0]))
+        st.link_button("💬 Open in WhatsApp", f"https://wa.me/{clean_ph}?text={urllib.parse.quote(msg)}", use_container_width=True)
 
 with tab_edit:
-    edited_port = st.data_editor(user_portfolio_df, num_rows="dynamic", use_container_width=True)
-    if st.button("💾 Save Portfolio"):
-        save_user_portfolio(username, edited_port)
+    st.markdown("#### ✏️ Update Your Portfolio Quantities & Buy Prices")
+    edited_port = st.data_editor(st.session_state.portfolio, num_rows="dynamic", use_container_width=True)
+    if st.button("💾 Save Portfolio Changes", type="primary"):
+        st.session_state.portfolio = edited_port
+        save_json(PORTFOLIO_FILE, edited_port.to_dict(orient="records"))
         st.cache_data.clear()
-        st.success("Saved!")
+        st.success("✅ Portfolio updated!")
