@@ -124,7 +124,6 @@ def fetch_user_stock_snapshot(df, fx):
             else:
                 ltp, chg = float(r["Buy_Price"]), 0.0
             
-            # P&L Calculations
             inv = float(r["Qty"]) * float(r["Buy_Price"]) * (fx if r["Market"] == "US" else 1.0)
             cur = float(r["Qty"]) * ltp * (fx if r["Market"] == "US" else 1.0)
             pnl = cur - inv
@@ -210,19 +209,47 @@ with tab_sync:
         st.success("Successfully connected to broker API!")
 
 with tab_port:
-    st.markdown("#### 📊 Live Portfolio Overview & P&L Tracker")
+    st.markdown("#### 📊 Easy-to-Understand Portfolio & Category Breakdown")
     live_df, _ = fetch_user_stock_snapshot(st.session_state.portfolio, usd_inr)
+    
     if not live_df.empty:
         tot_inv = live_df["Invested_INR"].sum()
         tot_cur = live_df["Current_INR"].sum()
         tot_pnl = tot_cur - tot_inv
         tot_pnl_pct = (tot_pnl / tot_inv) * 100 if tot_inv > 0 else 0.0
 
+        # Top Summary Metrics
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Invested", f"₹{tot_inv:,.0f}")
         col2.metric("Current Valuation", f"₹{tot_cur:,.0f}")
         col3.metric("Total Unrealized P&L", f"₹{tot_pnl:,.0f}", f"{tot_pnl_pct:+.2f}%")
 
+        st.divider()
+
+        # Category / Theme Breakdown & Pie Chart
+        st.markdown("##### 🥧 Asset Allocation by Sector / Theme")
+        theme_summary = live_df.groupby("Theme")["Current_INR"].sum().reset_index()
+        
+        # Display Pie Chart using Streamlit native chart
+        st.altair_chart(
+            __import__('altair').Chart(theme_summary).mark_arc(innerRadius=50).encode(
+                theta=__import__('altair').Theta(field="Current_INR", type="quantitative"),
+                color=__import__('altair').Color(field="Theme", type="nominal"),
+                tooltip=["Theme", "Current_INR"]
+            ).properties(height=300),
+            use_container_width=True
+        )
+
+        # Theme-wise breakdown cards
+        st.markdown("##### 📂 Category-Wise Valuations")
+        for _, row in theme_summary.iterrows():
+            theme_name = row["Theme"]
+            theme_val = row["Current_INR"]
+            theme_pct = (theme_val / tot_cur) * 100 if tot_cur > 0 else 0.0
+            st.markdown(f"**{theme_name}**: ₹{theme_val:,.0f} *({theme_pct:.1f}% of portfolio)*")
+
+        st.divider()
+        st.markdown("##### 📋 Detailed Holdings List")
         st.dataframe(
             live_df[["Ticker", "Name", "Theme", "Qty", "Buy_Price", "Live_Price", "Day_Chg_%", "Current_INR", "Unrealized_PnL", "PnL_%"]],
             use_container_width=True,
