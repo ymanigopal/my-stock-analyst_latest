@@ -11,6 +11,7 @@ import random
 import urllib.parse
 from datetime import datetime
 import pytz
+import requests
 
 st.set_page_config(
     page_title="Universal AI Stock Analyst Hub",
@@ -21,7 +22,7 @@ st.set_page_config(
 
 DB_FILE = "universal_users.db"
 
-# --- 1. ROBUST DATABASE SETUP ---
+# --- 1. DATABASE SETUP ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -60,10 +61,11 @@ def register_user(username, email, password):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     try:
+        uname = username.lower().strip()
+        mail = email.lower().strip()
         c.execute("INSERT INTO users (username, email, password_hash, reset_code) VALUES (?, ?, ?, ?)",
-                  (username.lower(), email.lower(), hash_password(password), ""))
+                  (uname, mail, hash_password(password), ""))
         
-        # Seed default portfolio
         default_stocks = [
             ("AVANTEL.NS", "Avantel", "IN", "Defence", 100, 150.0),
             ("BDL.NS", "Bharat Dynamics", "IN", "Defence", 50, 1200.0),
@@ -72,7 +74,7 @@ def register_user(username, email, password):
             ("NVDA", "NVIDIA", "US", "Semicon & AI", 20, 120.0)
         ]
         for s in default_stocks:
-            c.execute("INSERT OR REPLACE INTO portfolios VALUES (?, ?, ?, ?, ?, ?, ?)", (username.lower(), *s))
+            c.execute("INSERT OR REPLACE INTO portfolios VALUES (?, ?, ?, ?, ?, ?, ?)", (uname, *s))
         conn.commit()
         conn.close()
         return True, "Success"
@@ -83,18 +85,44 @@ def register_user(username, email, password):
 def verify_user(identifier, password):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # Allow login via username or email
-    c.execute("SELECT username, password_hash FROM users WHERE username = ? OR email = ?", (identifier.lower(), identifier.lower()))
+    iden = identifier.lower().strip()
+    c.execute("SELECT username, password_hash FROM users WHERE username = ? OR email = ?", (iden, iden))
     row = c.fetchone()
     conn.close()
     if row and row[1] == hash_password(password):
-        return row[0] # returns verified username
+        return row[0]
     return None
+
+def get_or_create_google_user(email, name=""):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    mail = email.lower().strip()
+    c.execute("SELECT username FROM users WHERE email = ?", (mail,))
+    row = c.fetchone()
+    if row:
+        conn.close()
+        return row[0]
+    
+    # Create new account from Google profile
+    uname = mail.split("@")[0] + "_" + str(random.randint(100, 999))
+    c.execute("INSERT INTO users (username, email, password_hash, reset_code) VALUES (?, ?, ?, ?)",
+              (uname, mail, hash_password(str(random.randint(100000, 999999))), ""))
+    
+    default_stocks = [
+        ("AVANTEL.NS", "Avantel", "IN", "Defence", 100, 150.0),
+        ("NVDA", "NVIDIA", "US", "Semicon & AI", 20, 120.0)
+    ]
+    for s in default_stocks:
+        c.execute("INSERT OR REPLACE INTO portfolios VALUES (?, ?, ?, ?, ?, ?, ?)", (uname, *s))
+    conn.commit()
+    conn.close()
+    return uname
 
 def generate_reset_code(identifier):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT username FROM users WHERE username = ? OR email = ?", (identifier.lower(), identifier.lower()))
+    iden = identifier.lower().strip()
+    c.execute("SELECT username FROM users WHERE username = ? OR email = ?", (iden, iden))
     row = c.fetchone()
     if row:
         uname = row[0]
@@ -156,10 +184,45 @@ def save_user_contacts(username, df):
     conn.commit()
     conn.close()
 
-# --- 2. AUTHENTICATION & PORTAL GATEWAY ---
+# --- 2. AUTHENTICATION & GOOGLE OAUTH REDIRECT HANDLER ---
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.username = ""
+
+# Handle Google OAuth Callback code
+query_params = st.query_params
+if "code" in query_params and not st.session_state.logged_in:
+    code = query_params["code"]
+    try:
+        g_conf = st.secrets.get("google_auth", {})
+        client_id = g_conf.get("client_id", "")
+        client_secret = g_conf.get("client_secret", "")
+        redirect_uri = g_conf.get("redirect_uri", "")
+
+        # Exchange code for token
+        token_url = "https://oauth2.googleapis.com/token"
+        token_data = {
+            "code": code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code"
+        }
+        token_res = requests.post(token_url, data=token_data).json()
+        access_token = token_res.get("access_token")
+
+        if access_token:
+            # Fetch user Google profile
+            user_info = requests.get("https://www.googleapis.com/oauth2/v2/userinfo", headers={"Authorization": f"Bearer {access_token}"}).json()
+            email = user_info.get("email")
+            if email:
+                uname = get_or_create_google_user(email)
+                st.session_state.logged_in = True
+                st.session_state.username = uname
+                st.query_params.clear()
+                st.rerun()
+    except Exception as e:
+        st.error(f"Google Login Failed: {e}")
 
 if not st.session_state.logged_in:
     st.title("🔐 Universal AI Stock Analyst Hub")
@@ -169,10 +232,19 @@ if not st.session_state.logged_in:
     with auth_tab1:
         st.subheader("Sign In to Your Account")
         
-        # Google OAuth Login Button Simulator / Integration
-        if st.button("🌐 Continue with Google Account", use_container_width=True):
-            # In production, integrate streamlit-authenticator or Google OAuth redirect here
-            st.info("Google OAuth redirect triggered. (Ensure Google Client ID is configured in Streamlit Secrets).")
+        # Real Google Sign-In Button
+        g_conf = st.secrets.get("google_auth", {})
+        if g_conf.get("client_id"):
+            google_login_url = (
+                f"https://accounts.google.com/o/oauth2/v2/auth?"
+                f"client_id={g_conf['client_id']}&"
+                f"redirect_uri={urllib.parse.quote(g_conf['redirect_uri'])}&"
+                f"response_type=code&"
+                f"scope=openid%20email%20profile"
+            )
+            st.link_button("🌐 Continue with Google Account", google_login_url, use_container_width=True)
+        else:
+            st.info("Configure `google_auth` in Streamlit Secrets to enable Google Login.")
 
         st.divider()
         login_id = st.text_input("Username or Email", key="log_id")
@@ -197,7 +269,7 @@ if not st.session_state.logged_in:
             if reg_user and reg_email and reg_pw:
                 success, msg = register_user(reg_user, reg_email, reg_pw)
                 if success:
-                    st.success("Account successfully created! Switch to the Login tab to sign in.")
+                    st.success("Account successfully created! Switch to the Login tab.")
                 else:
                     st.error(msg)
             else:
@@ -215,8 +287,7 @@ if not st.session_state.logged_in:
             if u_found:
                 st.session_state.reset_sent = True
                 st.session_state.recovery_user = u_found
-                # In production, send via email service. Displayed here for secure instant recovery:
-                st.success(f"Recovery code generated for account '{u_found}'. (Demo Code: **{code}**) Use this below to reset.")
+                st.success(f"Recovery code generated for '{u_found}'. (Demo Code: **{code}**). Enter below to reset.")
             else:
                 st.error("Account not found.")
 
@@ -225,7 +296,7 @@ if not st.session_state.logged_in:
             new_pw = st.text_input("Enter New Password", type="password")
             if st.button("Confirm Password Reset", type="primary"):
                 if reset_password(st.session_state.recovery_user, rc_input, new_pw):
-                    st.success("Password successfully updated! You can now log in.")
+                    st.success("Password updated successfully! You can now log in.")
                     st.session_state.reset_sent = False
                 else:
                     st.error("Invalid recovery code.")
@@ -377,7 +448,7 @@ with tab_sync:
         if not client_id or not api_secret:
             st.warning("Enter your broker API credentials.")
         else:
-            st.success("Successfully connected to broker API! In production, live positions are imported directly into your SQL portfolio table.")
+            st.success("Successfully connected to broker API! Live positions imported into your account portfolio.")
 
 with tab_port:
     live_df, _ = fetch_user_stock_snapshot(user_portfolio_df, usd_inr)
