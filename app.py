@@ -9,7 +9,6 @@ import os
 import urllib.parse
 from datetime import datetime
 
-# --- CLEAN MOBILE-FIRST PAGE CONFIG ---
 st.set_page_config(
     page_title="My AI Stock Analyst",
     page_icon="🧠",
@@ -74,7 +73,7 @@ with st.sidebar:
     gemini_key = st.text_input("Gemini API Key", value=default_key, type="password")
     model_choice = st.selectbox(
         "Latest Gemini Model",
-        ["gemini-2.5-flash", "gemini-2.5-pro"]
+        ["gemini-3.8-flash", "gemini-flash-latest"]
     )
     use_search = st.checkbox("Enable Live Google Search Grounding", value=True)
     usd_inr = st.number_input("USD/INR Rate (₹)", value=88.75, step=0.1)
@@ -85,21 +84,25 @@ with st.sidebar:
     twilio_token = st.text_input("Twilio Auth Token", value=st.secrets.get("TWILIO_TOKEN", "") if hasattr(st, "secrets") else "", type="password")
     twilio_from = st.text_input("Twilio WhatsApp/SMS From", value="whatsapp:+14155238886")
 
-# --- HELPER: CALL LATEST GEMINI SDK WITH GOOGLE SEARCH GROUNDING ---
+# --- HELPER: CALL GEMINI 3.8 FLASH ---
 def ask_gemini(prompt_text):
-    if not gemini_key:
+    clean_key = gemini_key.strip()
+    if not clean_key:
         st.warning("Tap the `>` arrow at the top-left to paste your Gemini API Key first!")
         return None
-    client = genai.Client(api_key=gemini_key)
-    config = types.GenerateContentConfig(
-        tools=[{"google_search": {}}] if use_search else None,
-        temperature=0.2
-    )
-    response = client.models.generate_content(
-        model=model_choice,
-        contents=prompt_text,
-        config=config
-    )
+    client = genai.Client(api_key=clean_key)
+    if use_search:
+        config = types.GenerateContentConfig(tools=[{"google_search": {}}])
+        response = client.models.generate_content(
+            model=model_choice,
+            contents=prompt_text,
+            config=config
+        )
+    else:
+        response = client.models.generate_content(
+            model=model_choice,
+            contents=prompt_text
+        )
     return response.text
 
 @st.cache_data(ttl=300)
@@ -126,7 +129,6 @@ def fetch_live_snapshot(df, fx):
         })
     return pd.DataFrame(rows)
 
-# --- APP HEADER & CLEAN 4-TAB NAVIGATION ---
 st.subheader("🧠 My Personal Stock Market Analyst")
 tab1, tab2, tab3, tab4 = st.tabs([
     "📊 Daily Analysis",
@@ -135,9 +137,6 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "✏️ Edit Portfolio"
 ])
 
-# ==============================================================================
-# TAB 1: PURE ANALYSIS VIEW (SHOWS ONLY YOUR ANALYSIS)
-# ==============================================================================
 with tab1:
     user_change_note = st.text_input(
         "Mention any change in your portfolio or ask a question (optional):",
@@ -145,13 +144,13 @@ with tab1:
     )
 
     if st.button("⚡ Generate Today's Live Portfolio Analysis", type="primary", use_container_width=True):
-        with st.spinner(f"Running {model_choice} with live market grounding across your 23 stocks..."):
+        with st.spinner(f"Running {model_choice} across your 23 stocks..."):
             live_df = fetch_live_snapshot(st.session_state.portfolio, usd_inr)
             prompt = f"""
             Act as my personal stock market analyst. Investment horizon: 3-5 years. Risk tolerance: High.
             Today's Date: {datetime.now().strftime('%d %b %Y')}
             My current portfolio with live prices and INR values:
-            {live_df.to_markdown(index=False)}
+            {live_df.to_string(index=False)}
 
             User Portfolio Update / Note: {user_change_note}
 
@@ -179,9 +178,6 @@ with tab1:
     else:
         st.info("Tap **Generate Today's Live Portfolio Analysis** above to view your clean daily report.")
 
-# ==============================================================================
-# TAB 2: STOCK RESULTS & LATEST UPDATES
-# ==============================================================================
 with tab2:
     st.markdown("#### 📰 Quarterly Earnings, Order Books & Filings")
     tickers_list = st.session_state.portfolio["Ticker"].tolist()
@@ -207,9 +203,6 @@ with tab2:
             except Exception as e:
                 st.error(f"Error: {e}")
 
-# ==============================================================================
-# TAB 3: WHATSAPP & SMS REMINDER MANAGER (ADD/CHANGE EXTRA NUMBERS)
-# ==============================================================================
 with tab3:
     st.markdown("#### 📲 Manage Phone Numbers for Daily Updates")
     st.caption("Tap any cell to change a number or tap the `+` row at the bottom to add extra phone numbers.")
@@ -233,7 +226,6 @@ with tab3:
     )
     msg_box = st.text_area("Daily Message to Send:", value=default_wa, height=150)
 
-    # Instant 1-Tap Mobile WhatsApp & SMS Links (Zero Twilio Required)
     active_nums = [str(c["Phone"]).strip() for c in st.session_state.contacts if c.get("Active", True)]
     if active_nums:
         encoded_msg = urllib.parse.quote(msg_box)
@@ -259,9 +251,6 @@ with tab3:
                 except Exception as e:
                     st.error(f"Failed for {num}: {e}")
 
-# ==============================================================================
-# TAB 4: EDIT PORTFOLIO HOLDINGS (HIDDEN FROM MAIN ANALYSIS VIEW)
-# ==============================================================================
 with tab4:
     st.markdown("#### ✏️ Update Your Portfolio Quantities & Buy Prices")
     st.caption("Whenever you buy or sell a stock, update it here and tap **Save Portfolio**. Tab 1 will automatically analyze your updated holdings.")
